@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+#  day5-postgres:
+#    image: postgres:16-alpine
+#    container_name: ai-gateway-day5-postgres
+#    restart: unless-stopped
+#    environment:
+#      POSTGRES_USER: ${POSTGRES_USER:-ai_gateway}
+#      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_gateway_password}
+#      POSTGRES_DB: ${POSTGRES_DB:-ai_gateway_day5}
+#    volumes:
+#      - day5_postgres_data:/var/lib/postgresql/data
+#    healthcheck:
+#      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_gateway}"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#    networks:
+#      - ai_gateway_shared_net
+
+#  day5-redis:
+#    image: redis:7-alpine
+#    container_name: ai-gateway-day5-redis
+#    restart: unless-stopped
+#    volumes:
+#      - day5_redis_data:/data
+#    healthcheck:
+#      test: ["CMD", "redis-cli", "ping"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#    networks:
+#      - ai_gateway_shared_net
+
+  day5-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-gateway-day5-app
+    restart: unless-stopped
+#    depends_on:
+#      day5-postgres:
+#        condition: service_healthy
+#      day5-redis:
+#        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: ai_gateway_4_of_10_postgres
+      REDIS_HOST: ai_gateway_4_of_10_redis
+    ports:
+      - "4407:8080"
+    networks:
+      - ai_gateway_shared_net
+
+networks:
+  ai_gateway_shared_net:
+    external: true
+
+volumes:
+  day5_postgres_data:
+  day5_redis_data:
