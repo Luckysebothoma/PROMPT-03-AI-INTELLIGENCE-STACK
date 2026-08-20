@@ -73,7 +73,7 @@ async function classify({ message, request_id, trace_id }) {
   // Branch 1: No classification worker available
   if (!resolved || !resolved.ok) {
     metrics.classificationFallbacksTotal.inc({ reason: 'no_worker' });
-    metrics.capabilityFallbackTotal.inc({ capability: 'classification', target: 'chat' });
+    metrics.capabilityFallbackTotal.inc({ requested_capability: 'classification', fallback_capability: 'chat' });
 
     const fallback = heuristicFallback(message);
     metrics.classificationEventsTotal.inc({ intent: fallback.intent, status: 'degraded', resolution: 'heuristic' });
@@ -114,7 +114,7 @@ async function classify({ message, request_id, trace_id }) {
   if (!result.ok) {
     metrics.workerFailuresTotal.inc({ worker: resolved.worker });
     metrics.classificationFallbacksTotal.inc({ reason: 'upstream_error' });
-    metrics.capabilityFallbackTotal.inc({ capability: 'classification', target: 'chat' });
+    metrics.capabilityFallbackTotal.inc({ requested_capability: 'classification', fallback_capability: 'chat' });
 
     const fallback = heuristicFallback(message);
     metrics.classificationEventsTotal.inc({ intent: fallback.intent, status: 'degraded', resolution: 'heuristic' });
@@ -147,7 +147,7 @@ async function classify({ message, request_id, trace_id }) {
   if (!parsed || !VALID_INTENTS.has(parsed.intent) || parsed.intent === 'unknown' || !Array.isArray(parsed.capabilities)) {
     const fallbackReason = !parsed ? 'parse_failure' : 'unknown_intent';
     metrics.classificationFallbacksTotal.inc({ reason: fallbackReason });
-    metrics.capabilityFallbackTotal.inc({ capability: 'classification', target: 'chat' });
+    metrics.capabilityFallbackTotal.inc({ requested_capability: 'classification', fallback_capability: 'chat' });
 
     const fallback = heuristicFallback(message);
     metrics.classificationEventsTotal.inc({ intent: fallback.intent, status: 'degraded', resolution: 'heuristic' });

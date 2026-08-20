@@ -37,9 +37,9 @@ const metrics = {
   redisCacheHits: counter('redis_cache_hits_total', 'Total redis cache hits'),
   redisCacheMisses: counter('redis_cache_misses_total', 'Total redis cache misses'),
 
-  capabilityFallbackTotal: counter('capability_fallback_total', 'Total requests that fell back to a different capability', ['capability', 'target']),
+  capabilityFallbackTotal: counter('capability_fallback_total', 'Total requests that fell back to a different capability', ['requested_capability', 'fallback_capability']),
 
-  // NEW METRICS FOR CLASSIFICATION MONITORING
+  // CLASSIFICATION MONITORING METRICS
   classificationEventsTotal: counter('classification_events_total', 'Total classification outcomes', ['intent', 'status', 'resolution']),
   classificationFallbacksTotal: counter('classification_fallbacks_total', 'Total classification fallbacks', ['reason'])
 };

@@ -47,7 +47,7 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: ai_gateway_4_of_10_postgres
+      POSTGRES_HOST: 192.168.0.140
       REDIS_HOST: ai_gateway_4_of_10_redis
     ports:
       - "4407:8080"
