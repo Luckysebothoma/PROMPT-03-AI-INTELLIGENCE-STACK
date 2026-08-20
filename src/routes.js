@@ -265,6 +265,7 @@ router.post('/v1/execute', async (req, res) => {
 // ---------------------------------------------------------------------
 
 router.post('/v1/chat', async (req, res) => {
+  try{
   metrics.chatRequestsTotal.inc();
 
   const { message, session_id, user_id, agent_name, metadata, depth: depthIn } = req.body || {};
@@ -400,6 +401,15 @@ router.post('/v1/chat', async (req, res) => {
     context_degraded: !!contextResult.degraded,
     classification_degraded: !!classification.degraded
   });
+}catch (err) {                                          // <-- catches anything unexpected instead of
+    console.error('[UNCAUGHT /v1/chat]', err);              //     an unhandled rejection / bare 500
+    await db.logOrchestrationEvent({
+      request_id: req.body && req.body.request_id, status: 'error', error_code: 'UNCAUGHT_EXCEPTION',
+      detail: { message: err.message }
+    }).catch(() => {}); // never let logging itself throw here
+    return sendError(res, 500, ERROR_CODES.UNKNOWN_ERROR, 'Internal server error');
+  }
+
 });
 
 module.exports = router;

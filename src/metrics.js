@@ -35,7 +35,9 @@ const metrics = {
   responseValidationFailuresTotal: counter('response_validation_failures_total', 'Total response validation failures'),
 
   redisCacheHits: counter('redis_cache_hits_total', 'Total redis cache hits'),
-  redisCacheMisses: counter('redis_cache_misses_total', 'Total redis cache misses')
+  redisCacheMisses: counter('redis_cache_misses_total', 'Total redis cache misses'),
+  // add alongside the other counter(...) entries
+capabilityFallbackTotal: counter('capability_fallback_total', 'Total requests that fell back to a different capability', ['requested_capability', 'fallback_capability']),
 };
 
 module.exports = metrics;

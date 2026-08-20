@@ -4,6 +4,7 @@ const resolver = require('./resolver');
 const day3Client = require('./day3Client');
 const metrics = require('./metrics');
 const { ERROR_CODES } = require('./errors');
+const db = require('./db');              // <-- new
 
 const VALID_INTENTS = new Set([
   'chat', 'vision', 'code', 'reasoning', 'summarization',
@@ -54,6 +55,11 @@ async function classify({ message, request_id, trace_id }) {
   const resolved = resolver.resolveCapability('classification');
   if (!resolved.ok) {
     // No classifier worker configured/available - degrade to heuristic rather than fail hard.
+    await db.logOrchestrationEvent({
+      request_id, trace_id, status: 'classification_degraded',
+      error_code: resolved.code,
+      detail: { reason: 'no_classification_worker', message: resolved.message }
+    });                                    // <-- new
     return { ...heuristicFallback(message), worker: null, provider: null, model: null, degraded: true };
   }
 
@@ -74,14 +80,15 @@ async function classify({ message, request_id, trace_id }) {
 
   if (!result.ok) {
     metrics.workerFailuresTotal.inc({ worker: resolved.worker });
-    // Day 3 unreachable/erroring - degrade to heuristic classification so /v1/chat can still proceed.
+    await db.logOrchestrationEvent({
+      request_id, trace_id, worker: resolved.worker, provider: resolved.provider, model: resolved.model,
+      status: 'classification_degraded', error_code: result.code,
+      detail: { reason: 'day3_execute_failed' }
+    });                                    // <-- new
     return {
       ...heuristicFallback(message),
-      worker: resolved.worker,
-      provider: resolved.provider,
-      model: resolved.model,
-      degraded: true,
-      upstream_error: result.code
+      worker: resolved.worker, provider: resolved.provider, model: resolved.model,
+      degraded: true, upstream_error: result.code
     };
   }
 
