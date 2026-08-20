@@ -6,6 +6,18 @@ const metrics = require('./metrics');
  * Structural validation only - NOT hallucination detection.
  * Checks: response exists, is not empty, provider/model metadata exists, request_id exists.
  */
+
+function validateResponse({ responseText, provider, model, request_id }) {
+  if (!responseText || typeof responseText !== 'string' || responseText.trim().length === 0) {
+    console.error(`[VALIDATION_FAILED] Empty response from provider="${provider}" model="${model}" request_id="${request_id}"`);
+    return {
+      valid: false,
+      reason: 'Response is empty or unparseable'
+    };
+  }
+
+  return { valid: true };
+}
 function validateResponse({ responseText, provider, model, request_id }) {
   metrics.responseValidationTotal.inc();
 
