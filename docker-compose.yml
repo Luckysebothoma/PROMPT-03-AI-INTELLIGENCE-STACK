@@ -47,15 +47,17 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: 192.168.0.140
-      REDIS_HOST: ai_gateway_4_of_10_redis
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      REDIS_HOST: ${REDIS_HOST}
     ports:
       - "4407:8080"
     networks:
-      - ai_gateway_shared_net
+      - ai-gateway-net
 
 networks:
-  ai_gateway_shared_net:
+  ai-gateway-net:
+    external: true
+  databases:
     external: true
 
 volumes:

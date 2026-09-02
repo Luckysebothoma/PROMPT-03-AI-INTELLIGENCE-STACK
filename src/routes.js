@@ -18,6 +18,11 @@ const { ERROR_CODES, sendError } = require('./errors');
 const router = express.Router();
 
 function extractText(data) {
+  // 1. Stack 3 /v1/execute native contract (the one this gateway actually talks to)
+  if (typeof data?.response === 'string' && data.response.trim()) {
+    return data.response;
+  }
+
   // 4. Gemini native format
 const geminiParts = data?.candidates?.[0]?.content?.parts;
 if (Array.isArray(geminiParts)) {

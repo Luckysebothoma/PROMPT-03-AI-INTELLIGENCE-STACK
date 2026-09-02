@@ -42,7 +42,7 @@ function tryParseJson(text) {
  */
 function extractText(data) {
   if (typeof data === 'string') return data;
-  return data?.choices?.[0]?.message?.content || data?.content || '';
+  return data?.response || data?.choices?.[0]?.message?.content || data?.content || '';
 }
 
 /**
