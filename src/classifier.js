@@ -11,9 +11,23 @@ const VALID_INTENTS = new Set([
   'extraction', 'translation', 'classification', 'unknown'
 ]);
 
+// --- .env-configurable defaults for hard-failure fallback ---
+const RAW_DEFAULT_INTENT = (process.env.CLASSIFICATION_DEFAULT_INTENT || 'chat').toLowerCase().trim();
+const DEFAULT_INTENT = VALID_INTENTS.has(RAW_DEFAULT_INTENT) && RAW_DEFAULT_INTENT !== 'unknown'
+  ? RAW_DEFAULT_INTENT
+  : 'chat';
+
+const DEFAULT_CAPABILITIES = (process.env.CLASSIFICATION_DEFAULT_CAPABILITIES || DEFAULT_INTENT)
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const CLASSIFIER_SYSTEM_PROMPT = `You are an intent classification engine for an AI gateway.
 Classify the user's message into exactly one JSON object with this shape:
 {"intent":"chat|vision|code|reasoning|summarization|extraction|translation|classification|unknown","task":"short_snake_case_task_name","capabilities":["capability1","capability2"],"confidence":0.0-1.0,"reason":"short reason"}
+Rules:
+- "capabilities" is REQUIRED and MUST be a non-empty JSON array of strings. If unsure, repeat the intent name, e.g. ["chat"].
+- Never omit "capabilities", and never return null, an empty array, or a string for it.
 Respond with ONLY the JSON object. No prose, no markdown fences.`;
 
 /**
@@ -37,17 +51,11 @@ function tryParseJson(text) {
   }
 }
 
-/**
- * Extract completion text safely across standard provider response structures.
- */
 function extractText(data) {
   if (typeof data === 'string') return data;
   return data?.response || data?.choices?.[0]?.message?.content || data?.content || '';
 }
 
-/**
- * Heuristic fallback parser when classification worker is missing or fails.
- */
 function heuristicFallback(message) {
   const text = (message || '').toLowerCase();
   if (/image|picture|photo|screenshot|identify what/i.test(text)) {
@@ -62,7 +70,8 @@ function heuristicFallback(message) {
   if (/translate/i.test(text)) {
     return { intent: 'translation', task: 'translate_text', capabilities: ['translation'], confidence: 0.5, reason: 'heuristic fallback' };
   }
-  return { intent: 'chat', task: 'conversation', capabilities: ['chat'], confidence: 0.4, reason: 'heuristic fallback' };
+  // Ultimate fallback now driven by .env instead of a hardcoded 'chat'
+  return { intent: DEFAULT_INTENT, task: 'conversation', capabilities: DEFAULT_CAPABILITIES, confidence: 0.4, reason: 'heuristic fallback (default)' };
 }
 
 async function classify({ message, request_id, trace_id }) {
@@ -86,13 +95,7 @@ async function classify({ message, request_id, trace_id }) {
       detail: { reason: 'no_classification_worker', message: resolved?.message }
     });
 
-    return {
-      ...fallback,
-      worker: null,
-      provider: null,
-      model: null,
-      degraded: true
-    };
+    return { ...fallback, worker: null, provider: null, model: null, degraded: true };
   }
 
   metrics.workerRequestsTotal.inc({ worker: resolved.worker });
@@ -130,21 +133,56 @@ async function classify({ message, request_id, trace_id }) {
       detail: { reason: 'day3_execute_failed' }
     });
 
-    return {
-      ...fallback,
-      worker: resolved.worker,
-      provider: resolved.provider,
-      model: resolved.model,
-      degraded: true,
-      upstream_error: result.code
-    };
+    return { ...fallback, worker: resolved.worker, provider: resolved.provider, model: resolved.model, degraded: true, upstream_error: result.code };
   }
 
   const text = extractText(result.data);
-  const parsed = tryParseJson(text);
 
-  // Branch 3: Invalid output structure, unknown intent, or non-JSON response
-  if (!parsed || !VALID_INTENTS.has(parsed.intent) || parsed.intent === 'unknown' || !Array.isArray(parsed.capabilities)) {
+  // --- try/catch around parsing + validation ---
+  let parsed = null;
+  try {
+    parsed = tryParseJson(text);
+  } catch (err) {
+    parsed = null;
+  }
+
+  const hasValidIntent = !!parsed && VALID_INTENTS.has(parsed.intent) && parsed.intent !== 'unknown';
+  const hasCapabilities = Array.isArray(parsed?.capabilities) && parsed.capabilities.length > 0;
+
+  // Branch 3a (soft failure): intent is valid, only "capabilities" is missing/malformed.
+  // This is an ambiguity in the model's output, not a real misclassification —
+  // repair it and return as a successful result instead of dropping to heuristics.
+  if (hasValidIntent && !hasCapabilities) {
+    metrics.classificationFallbacksTotal.inc({ reason: 'capabilities_missing' });
+    metrics.classificationEventsTotal.inc({ intent: parsed.intent, status: 'success', resolution: 'model_repaired' });
+
+    await db.logOrchestrationEvent({
+      request_id,
+      trace_id,
+      worker: resolved.worker,
+      provider: resolved.provider,
+      model: resolved.model,
+      status: 'classification_capabilities_missing',
+      error_code: 'CLASSIFICATION_CAPABILITIES_MISSING',
+      detail: { raw_text: text }
+    });
+
+    return {
+      intent: parsed.intent,
+      task: parsed.task || 'unknown_task',
+      capabilities: [parsed.intent],
+      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+      reason: parsed.reason || 'capabilities backfilled from intent',
+      worker: resolved.worker,
+      provider: resolved.provider,
+      model: resolved.model,
+      failed: false,
+      repaired: true
+    };
+  }
+
+  // Branch 3b (hard failure): unparseable JSON or a genuinely invalid/unknown intent
+  if (!hasValidIntent) {
     const fallbackReason = !parsed ? 'parse_failure' : 'unknown_intent';
     metrics.classificationFallbacksTotal.inc({ reason: fallbackReason });
     metrics.capabilityFallbackTotal.inc({ requested_capability: 'classification', fallback_capability: 'chat' });
@@ -163,13 +201,7 @@ async function classify({ message, request_id, trace_id }) {
       detail: { raw_text: text }
     });
 
-    return {
-      ...fallback,
-      worker: resolved.worker,
-      provider: resolved.provider,
-      model: resolved.model,
-      degraded: true
-    };
+    return { ...fallback, worker: resolved.worker, provider: resolved.provider, model: resolved.model, degraded: true };
   }
 
   // Branch 4: Successful classification

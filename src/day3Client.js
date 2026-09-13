@@ -6,6 +6,42 @@ const { ERROR_CODES } = require('./errors');
 
 const client = axios.create({ baseURL: config.day3Url, timeout: 30000 });
 
+const N8N_COMFY_WEBHOOK_URL = process.env.N8N_COMFY_WEBHOOK_URL || null;
+
+// Best-effort, non-blocking notify. Never throws, never awaited by callers.
+// n8n's Function node expects: { message, session_id, external_ref, title, detected_niche, variant_count }
+function notifyComfyWebhook({ request_id, trace_id, message, detected_niche }) {
+  if (!N8N_COMFY_WEBHOOK_URL) {
+    console.log(`[n8n_comfy_webhook] skipped (no N8N_COMFY_WEBHOOK_URL configured) request_id=${request_id}`);
+    return;
+  }
+  if (!message || !String(message).trim()) {
+    console.log(`[n8n_comfy_webhook] skipped (empty message) request_id=${request_id}`);
+    return;
+  }
+
+  const payload = {
+    message: String(message).trim(),
+    session_id: request_id || trace_id,
+    external_ref: trace_id || null,
+    title: String(message).trim().slice(0, 60),
+    detected_niche: detected_niche || null,
+    variant_count: null,
+  };
+
+  console.log(`[n8n_comfy_webhook] sending request_id=${request_id} title="${payload.title}"`);
+
+  Promise.resolve()
+    .then(() => axios.post(N8N_COMFY_WEBHOOK_URL, payload, { timeout: 10000 }))
+    .then((res) => {
+      console.log(`[n8n_comfy_webhook] sent OK request_id=${request_id} status=${res.status}`);
+    })
+    .catch((err) => {
+      const status = err.response ? err.response.status : 'no_response';
+      console.warn(`[n8n_comfy_webhook] failed request_id=${request_id} status=${status} error=${err.message}`);
+    });
+}
+
 async function isAvailable() {
   try {
     await client.get('/health');
@@ -30,6 +66,16 @@ async function execute({ provider, model, messages, temperature, max_tokens, req
       request_id,
       trace_id
     });
+
+    // Best-effort side call — fire-and-forget, never blocks or affects the caller's response.
+    const responseText = extractResponseText(res.data);
+    notifyComfyWebhook({
+      request_id,
+      trace_id,
+      message: responseText,
+      detected_niche: provider || null,
+    });
+
     return { ok: true, data: res.data };
   } catch (err) {
     if (!err.response) {
@@ -59,6 +105,16 @@ async function execute({ provider, model, messages, temperature, max_tokens, req
       message: (upstream && upstream.message) || 'Invalid execution request'
     };
   }
+}
+
+function extractResponseText(data) {
+  if (!data) return '';
+  if (typeof data.response === 'string') return data.response;
+  if (data.response && typeof data.response === 'object') {
+    return data.response.text || data.response.content || '';
+  }
+  if (typeof data.message === 'string') return data.message;
+  return '';
 }
 
 module.exports = { isAvailable, execute };

@@ -53,11 +53,14 @@ services:
       - "4407:8080"
     networks:
       - ai-gateway-net
+      - obs-network
 
 networks:
   ai-gateway-net:
     external: true
   databases:
+    external: true
+  obs-network:
     external: true
 
 volumes:
