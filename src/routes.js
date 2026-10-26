@@ -468,7 +468,8 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
     response: responseText,
     depth,
     max_depth,
-    context_degraded: !!contextResult.degraded || !!sessionResult.degraded,\n    persistence_degraded: !userPersist.persisted || !assistantPersist.persisted,
+    context_degraded: !!contextResult.degraded || !!sessionResult.degraded,
+    persistence_degraded: !userPersist.persisted || !assistantPersist.persisted,
     classification_degraded: !!classification.degraded
   });
 }catch (err) {                                          // <-- catches anything unexpected instead of
