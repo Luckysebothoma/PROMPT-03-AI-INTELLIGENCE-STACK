@@ -46,6 +46,16 @@ router.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'ai-gateway-day5', time: new Date().toISOString() });
 });
 
+router.get('/v1/context/status', async (req, res) => {
+  const available = await day4Client.isAvailable();
+  res.status(available ? 200 : 503).json({
+    success: available,
+    dependency: 'day4-context',
+    available,
+    degraded: !available
+  });
+});
+
 router.get('/ready', async (req, res) => {
   let pgOk = false;
   try {
@@ -305,10 +315,20 @@ router.post('/v1/chat', async (req, res) => {
   }
 
   // 4. Resolve session (Day 4)
-  const sessionResult = await day4Client.ensureSession(session_id, user_id);
-  const resolvedSessionId = sessionResult.session_id || session_id || null;
+  const sessionResult = await day4Client.ensureSession(session_id, user_id, {
+    ...(metadata || {}),
+    agent_name: agent_name || 'general-assistant'
+  });
 
-  // 5. Retrieve context from Day 4
+  if (sessionResult.invalid_session) {
+    return sendError(res, 404, ERROR_CODES.INVALID_REQUEST, 'The supplied session_id does not exist in Day 4', {
+      request_id, trace_id, session_id, depth, max_depth
+    });
+  }
+
+  const resolvedSessionId = sessionResult.session_id || null;
+
+  // 5. Retrieve prior history from Day 4 before adding this request's message.
   const contextResult = await day4Client.getContext(resolvedSessionId);
 
   // 6-9. Classify request -> intent / task / capabilities
@@ -426,8 +446,8 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
   }
 
   // 16. Persist relevant conversation information through Day 4
-  await day4Client.persistTurn(resolvedSessionId, { role: 'user', content: message, meta: { agent_name, metadata, request_id, trace_id } });
-  await day4Client.persistTurn(resolvedSessionId, { role: 'assistant', content: responseText, meta: { worker: resolved.worker, provider: resolved.provider, model: resolved.model, request_id, trace_id } });
+  const userPersist = await day4Client.persistTurn(resolvedSessionId, { role: 'user', content: message, metadata: { agent_name, ...(metadata || {}), request_id, trace_id } });
+  const assistantPersist = await day4Client.persistTurn(resolvedSessionId, { role: 'assistant', content: responseText, metadata: { worker: resolved.worker, provider: resolved.provider, model: resolved.model, request_id, trace_id } });
 
   await db.logOrchestrationEvent({
     request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
@@ -448,7 +468,7 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
     response: responseText,
     depth,
     max_depth,
-    context_degraded: !!contextResult.degraded,
+    context_degraded: !!contextResult.degraded || !!sessionResult.degraded,\n    persistence_degraded: !userPersist.persisted || !assistantPersist.persisted,
     classification_degraded: !!classification.degraded
   });
 }catch (err) {                                          // <-- catches anything unexpected instead of
