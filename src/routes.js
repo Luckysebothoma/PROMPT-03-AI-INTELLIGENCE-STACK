@@ -23,19 +23,30 @@ function extractText(data) {
     return data.response;
   }
 
-  // 4. Gemini native format
-const geminiParts = data?.candidates?.[0]?.content?.parts;
-if (Array.isArray(geminiParts)) {
-  const text = geminiParts.map(p => p.text || '').join('').trim();
-  if (text) return text;
+  // 2. Gemini native format
+  const geminiParts = data?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(geminiParts)) {
+    const text = geminiParts.map((p) => p.text || '').join('').trim();
+    if (text) return text;
+  }
+
+  // 3. Anthropic content array format
+  if (Array.isArray(data?.content)) {
+    const textPart = data.content.find((c) => c.type === 'text' || typeof c.text === 'string');
+    if (textPart?.text) return textPart.text.trim();
+  }
+
+  // 4. Everything else (OpenAI-style etc.)
+  return classifier.extractText(data);
 }
 
-// 5. Anthropic content array format
-if (Array.isArray(data?.content)) {
-  const textPart = data.content.find((c) => c.type === 'text' || typeof c.text === 'string');
-  if (textPart?.text) return textPart.text.trim();
-}
-  return classifier.extractText(data);
+// Only roles every provider accepts go to Day 3; Day 4 may also hold 'tool' rows.
+const HISTORY_ROLES = new Set(['system', 'user', 'assistant']);
+
+function buildHistory(contextMessages) {
+  return (Array.isArray(contextMessages) ? contextMessages : [])
+    .filter((m) => m && HISTORY_ROLES.has(m.role) && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content }));
 }
 
 // ---------------------------------------------------------------------
@@ -200,7 +211,7 @@ router.post('/v1/resolve', (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// POST /v1/execute (internal-oriented)
+// POST /v1/execute (internal-oriented; stateless - does not touch Day 4)
 // ---------------------------------------------------------------------
 
 router.post('/v1/execute', async (req, res) => {
@@ -279,187 +290,219 @@ router.post('/v1/execute', async (req, res) => {
 
 // ---------------------------------------------------------------------
 // POST /v1/chat - primary human-facing endpoint
+//   Flow: session (Day 4) -> context (Day 4) -> classify -> resolve
+//         -> execute (Day 3) -> normalize -> validate -> persist (Day 4) -> respond
 // ---------------------------------------------------------------------
 
 router.post('/v1/chat', async (req, res) => {
-  try{
-  metrics.chatRequestsTotal.inc();
-
-  const { message, session_id, user_id, agent_name, metadata, depth: depthIn } = req.body || {};
-
-  if (!message || typeof message !== 'string') {
-    return sendError(res, 400, ERROR_CODES.INVALID_REQUEST, 'Field "message" is required');
-  }
-
   const request_id = uuidv4();
-  const trace_id = req.body.trace_id || uuidv4();
-  const depth = typeof depthIn === 'number' ? depthIn : 0;
-  const max_depth = config.maxOrchestrationDepth;
+  try {
+    metrics.chatRequestsTotal.inc();
 
-  if (depth >= max_depth) {
-    metrics.orchestrationDepthExceededTotal.inc();
-    metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.MAX_ORCHESTRATION_DEPTH });
-    return sendError(res, 429, ERROR_CODES.MAX_ORCHESTRATION_DEPTH, 'Maximum orchestration depth exceeded', {
-      request_id, trace_id, depth, max_depth
+    const { message, session_id, user_id, agent_name, metadata, depth: depthIn } = req.body || {};
+
+    if (!message || typeof message !== 'string') {
+      return sendError(res, 400, ERROR_CODES.INVALID_REQUEST, 'Field "message" is required');
+    }
+
+    const trace_id = req.body.trace_id || uuidv4();
+    const depth = typeof depthIn === 'number' ? depthIn : 0;
+    const max_depth = config.maxOrchestrationDepth;
+
+    if (depth >= max_depth) {
+      metrics.orchestrationDepthExceededTotal.inc();
+      metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.MAX_ORCHESTRATION_DEPTH });
+      return sendError(res, 429, ERROR_CODES.MAX_ORCHESTRATION_DEPTH, 'Maximum orchestration depth exceeded', {
+        request_id, trace_id, depth, max_depth
+      });
+    }
+
+    // 4. Resolve session (Day 4). A client-supplied id Day 4 doesn't know is replaced,
+    //    never trusted blindly.
+    const sessionResult = await day4Client.ensureSession(session_id, user_id, agent_name, metadata);
+    const day4Usable = !sessionResult.degraded && !!sessionResult.session_id;
+    const resolvedSessionId = sessionResult.session_id || (typeof session_id === 'string' ? session_id : null);
+
+    if (sessionResult.replaced) {
+      console.warn(`[chat] session "${sessionResult.previous_session_id}" unknown to Day 4; replaced with ${sessionResult.session_id} request_id=${request_id}`);
+    }
+
+    // 5. Retrieve context from Day 4 (skipped for a brand-new session: nothing to fetch)
+    let contextResult;
+    if (!day4Usable) {
+      contextResult = { messages: [], message_count: 0, degraded: true, reason: sessionResult.reason || 'session_unavailable' };
+    } else if (sessionResult.created) {
+      contextResult = { messages: [], message_count: 0, degraded: false };
+    } else {
+      contextResult = await day4Client.getContext(resolvedSessionId);
+    }
+
+    // 6-9. Classify request -> intent / task / capabilities
+    const classification = await classifier.classify({ message, request_id, trace_id });
+
+    if (classification.failed) {
+      metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.CLASSIFICATION_FAILED });
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, status: 'error', error_code: ERROR_CODES.CLASSIFICATION_FAILED
+      });
+      return sendError(res, 422, ERROR_CODES.CLASSIFICATION_FAILED, 'Could not classify request', {
+        request_id, trace_id, session_id: resolvedSessionId, depth, max_depth
+      });
+    }
+
+    // 10-12. Select worker / model / provider (capability -> intent -> chat fallbacks)
+    const primaryCapability = (classification.capabilities && classification.capabilities[0]) || classification.intent || 'chat';
+    let resolved = resolver.resolveCapability(primaryCapability);
+    let effectiveCapability = primaryCapability;
+
+    if (!resolved.ok && classification.intent && classification.intent !== primaryCapability) {
+      const intentResolved = resolver.resolveCapability(classification.intent);
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
+        status: 'capability_fallback', error_code: resolved.code,
+        detail: { requested_capability: primaryCapability, fallback_capability: classification.intent, fallback_source: 'intent', fallback_available: intentResolved.ok }
+      });
+      if (intentResolved.ok) {
+        metrics.capabilityFallbackTotal.inc({ requested_capability: primaryCapability, fallback_capability: classification.intent });
+        resolved = intentResolved;
+        effectiveCapability = classification.intent;
+      }
+    }
+
+    if (!resolved.ok && effectiveCapability !== 'chat') {
+      const chatResolved = resolver.resolveCapability('chat');
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
+        status: 'capability_fallback', error_code: resolved.code,
+        detail: { requested_capability: effectiveCapability, fallback_capability: 'chat', fallback_source: 'safety_net', fallback_available: chatResolved.ok }
+      });
+      if (chatResolved.ok) {
+        metrics.capabilityFallbackTotal.inc({ requested_capability: effectiveCapability, fallback_capability: 'chat' });
+        resolved = chatResolved;
+        effectiveCapability = 'chat';
+      }
+    }
+
+    if (!resolved.ok) {
+      metrics.normalizedErrorsTotal.inc({ code: resolved.code });
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
+        status: 'error', error_code: resolved.code
+      });
+      return sendError(res, 404, resolved.code, resolved.message, {
+        request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task, depth, max_depth
+      });
+    }
+
+    // Build message history for the worker: prior Day 4 context + new user turn
+    const history = buildHistory(contextResult.messages);
+    const chatMessages = [...history, { role: 'user', content: message }];
+
+    metrics.workerRequestsTotal.inc({ worker: resolved.worker });
+
+    // 13. Execute through Day 3
+    const execResult = await day3Client.execute({
+      provider: resolved.provider,
+      model: resolved.model,
+      messages: chatMessages,
+      temperature: resolved.temperature,
+      max_tokens: resolved.max_tokens,
+      request_id,
+      trace_id
     });
-  }
 
-  // 4. Resolve session (Day 4)
-  const sessionResult = await day4Client.ensureSession(session_id, user_id);
-  const resolvedSessionId = sessionResult.session_id || session_id || null;
+    if (!execResult.ok) {
+      metrics.workerFailuresTotal.inc({ worker: resolved.worker });
+      metrics.providerErrorsTotal.inc({ provider: resolved.provider });
+      metrics.modelErrorsTotal.inc({ provider: resolved.provider, model: resolved.model });
+      metrics.normalizedErrorsTotal.inc({ code: execResult.code });
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
+        model: resolved.model, intent: classification.intent, task: classification.task, status: 'error', error_code: execResult.code
+      });
+      return sendError(res, 502, execResult.code, execResult.message, {
+        request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker,
+        provider: resolved.provider, model: resolved.model, intent: classification.intent, task: classification.task, depth, max_depth
+      });
+    }
 
-  // 5. Retrieve context from Day 4
-  const contextResult = await day4Client.getContext(resolvedSessionId);
+    // 14. Normalize provider response
+    const responseText = extractText(execResult.data);
 
-  // 6-9. Classify request -> intent / task / capabilities
-  const classification = await classifier.classify({ message, request_id, trace_id });
-
-  if (classification.failed) {
-    metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.CLASSIFICATION_FAILED });
-    await db.logOrchestrationEvent({
-      request_id, trace_id, session_id: resolvedSessionId, status: 'error', error_code: ERROR_CODES.CLASSIFICATION_FAILED
+    // 15. Validate response
+    const validation = validator.validateResponse({
+      responseText, provider: resolved.provider, model: resolved.model, request_id
     });
-    return sendError(res, 422, ERROR_CODES.CLASSIFICATION_FAILED, 'Could not classify request', {
-      request_id, trace_id, session_id: resolvedSessionId, depth, max_depth
-    });
-  }
-/*
-  const capability = (classification.capabilities && classification.capabilities[0]) || classification.intent || 'chat';
-*/
 
-// src/routes.js — replace the capability/resolve block in POST /v1/chat
-const primaryCapability = (classification.capabilities && classification.capabilities[0]) || classification.intent || 'chat';
-let resolved = resolver.resolveCapability(primaryCapability);
-let effectiveCapability = primaryCapability;
-  // 10-12. Select worker / model / provider
+    if (!validation.valid) {
+      metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.RESPONSE_VALIDATION_FAILED });
+      await db.logOrchestrationEvent({
+        request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
+        model: resolved.model, intent: classification.intent, task: classification.task,
+        status: 'error', error_code: ERROR_CODES.RESPONSE_VALIDATION_FAILED
+      });
+      return sendError(res, 502, ERROR_CODES.RESPONSE_VALIDATION_FAILED, validation.reason, {
+        request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker,
+        provider: resolved.provider, model: resolved.model, depth, max_depth
+      });
+    }
 
-if (!resolved.ok && classification.intent && classification.intent !== primaryCapability) {
-  const intentResolved = resolver.resolveCapability(classification.intent);
-  await db.logOrchestrationEvent({
-    request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
-    status: 'capability_fallback', error_code: resolved.code,
-    detail: { requested_capability: primaryCapability, fallback_capability: classification.intent, fallback_source: 'intent', fallback_available: intentResolved.ok }
-  });
-  if (intentResolved.ok) {
-    metrics.capabilityFallbackTotal.inc({ requested_capability: primaryCapability, fallback_capability: classification.intent });
-    resolved = intentResolved;
-    effectiveCapability = classification.intent;
-  }
-}
+    // 16. Persist the turn through Day 4 (only for a valid Day 4 session, and only
+    //     after a validated response, so failed turns never pollute history).
+    //     Sequential on purpose: Day 4 orders messages by insert sequence.
+    let persistDegraded = !day4Usable;
+    if (day4Usable) {
+      const u = await day4Client.persistTurn(resolvedSessionId, {
+        role: 'user', content: message, meta: { agent_name, metadata, request_id, trace_id }
+      });
+      const a = await day4Client.persistTurn(resolvedSessionId, {
+        role: 'assistant', content: responseText,
+        meta: { worker: resolved.worker, provider: resolved.provider, model: resolved.model, request_id, trace_id }
+      });
+      persistDegraded = !(u.persisted && a.persisted);
+    }
 
-if (!resolved.ok && effectiveCapability !== 'chat') {
-  const chatResolved = resolver.resolveCapability('chat');
-  await db.logOrchestrationEvent({
-    request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
-    status: 'capability_fallback', error_code: resolved.code,
-    detail: { requested_capability: effectiveCapability, fallback_capability: 'chat', fallback_source: 'safety_net', fallback_available: chatResolved.ok }
-  });
-  if (chatResolved.ok) {
-    metrics.capabilityFallbackTotal.inc({ requested_capability: effectiveCapability, fallback_capability: 'chat' });
-    resolved = chatResolved;
-    effectiveCapability = 'chat';
-  }
-}
-
-  if (!resolved.ok) {
-    metrics.normalizedErrorsTotal.inc({ code: resolved.code });
-    await db.logOrchestrationEvent({
-      request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task,
-      status: 'error', error_code: resolved.code
-    });
-    return sendError(res, 404, resolved.code, resolved.message, {
-      request_id, trace_id, session_id: resolvedSessionId, intent: classification.intent, task: classification.task, depth, max_depth
-    });
-  }
-
-  // Build message history for the worker: prior context + new user turn
-  const history = (contextResult.messages || []).map((m) => ({ role: m.role, content: m.content }));
-  const chatMessages = [...history, { role: 'user', content: message }];
-
-  metrics.workerRequestsTotal.inc({ worker: resolved.worker });
-
-  // 13. Execute through Day 3
-  const execResult = await day3Client.execute({
-    provider: resolved.provider,
-    model: resolved.model,
-    messages: chatMessages,
-    temperature: resolved.temperature,
-    max_tokens: resolved.max_tokens,
-    request_id,
-    trace_id
-  });
-
-  if (!execResult.ok) {
-    metrics.workerFailuresTotal.inc({ worker: resolved.worker });
-    metrics.providerErrorsTotal.inc({ provider: resolved.provider });
-    metrics.modelErrorsTotal.inc({ provider: resolved.provider, model: resolved.model });
-    metrics.normalizedErrorsTotal.inc({ code: execResult.code });
     await db.logOrchestrationEvent({
       request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
-      model: resolved.model, intent: classification.intent, task: classification.task, status: 'error', error_code: execResult.code
+      model: resolved.model, intent: classification.intent, task: classification.task, status: 'success',
+      detail: { context_degraded: !!contextResult.degraded, persist_degraded: persistDegraded, context_messages: history.length }
     });
-    return sendError(res, 502, execResult.code, execResult.message, {
-      request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker,
-      provider: resolved.provider, model: resolved.model, intent: classification.intent, task: classification.task, depth, max_depth
+
+    // 17. Return final response. The client MUST adopt `session_id` from this response
+    //     (it differs from the one it sent when session_replaced is true).
+    res.json({
+      success: true,
+      session_id: resolvedSessionId,
+      session_created: !!sessionResult.created,
+      session_replaced: !!sessionResult.replaced,
+      previous_session_id: sessionResult.replaced ? sessionResult.previous_session_id : undefined,
+      request_id,
+      trace_id,
+      intent: classification.intent,
+      task: classification.task,
+      worker: resolved.worker,
+      provider: resolved.provider,
+      model: resolved.model,
+      response: responseText,
+      depth,
+      max_depth,
+      context_messages: history.length,
+      context_degraded: !!contextResult.degraded,
+      persist_degraded: persistDegraded,
+      classification_degraded: !!classification.degraded
     });
+  } catch (err) {
+    // Catches anything unexpected instead of an unhandled rejection / bare 500
+    console.error('[UNCAUGHT /v1/chat]', err);
+    try {
+      await db.logOrchestrationEvent({
+        request_id, status: 'error', error_code: 'UNCAUGHT_EXCEPTION', detail: { message: err.message }
+      });
+    } catch (logErr) {
+      // never let logging itself throw here
+    }
+    return sendError(res, 500, ERROR_CODES.UNKNOWN_ERROR, 'Internal server error', { request_id });
   }
-
-  // 14. Normalize provider response
-  const responseText = extractText(execResult.data);
-
-  // 15. Validate response
-  const validation = validator.validateResponse({
-    responseText, provider: resolved.provider, model: resolved.model, request_id
-  });
-
-  if (!validation.valid) {
-    metrics.normalizedErrorsTotal.inc({ code: ERROR_CODES.RESPONSE_VALIDATION_FAILED });
-    await db.logOrchestrationEvent({
-      request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
-      model: resolved.model, intent: classification.intent, task: classification.task,
-      status: 'error', error_code: ERROR_CODES.RESPONSE_VALIDATION_FAILED
-    });
-    return sendError(res, 502, ERROR_CODES.RESPONSE_VALIDATION_FAILED, validation.reason, {
-      request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker,
-      provider: resolved.provider, model: resolved.model, depth, max_depth
-    });
-  }
-
-  // 16. Persist relevant conversation information through Day 4
-  await day4Client.persistTurn(resolvedSessionId, { role: 'user', content: message, meta: { agent_name, metadata, request_id, trace_id } });
-  await day4Client.persistTurn(resolvedSessionId, { role: 'assistant', content: responseText, meta: { worker: resolved.worker, provider: resolved.provider, model: resolved.model, request_id, trace_id } });
-
-  await db.logOrchestrationEvent({
-    request_id, trace_id, session_id: resolvedSessionId, worker: resolved.worker, provider: resolved.provider,
-    model: resolved.model, intent: classification.intent, task: classification.task, status: 'success'
-  });
-
-  // 17. Return final response
-  res.json({
-    success: true,
-    session_id: resolvedSessionId,
-    request_id,
-    trace_id,
-    intent: classification.intent,
-    task: classification.task,
-    worker: resolved.worker,
-    provider: resolved.provider,
-    model: resolved.model,
-    response: responseText,
-    depth,
-    max_depth,
-    context_degraded: !!contextResult.degraded,
-    classification_degraded: !!classification.degraded
-  });
-}catch (err) {                                          // <-- catches anything unexpected instead of
-    console.error('[UNCAUGHT /v1/chat]', err);              //     an unhandled rejection / bare 500
-    await db.logOrchestrationEvent({
-      request_id: req.body && req.body.request_id, status: 'error', error_code: 'UNCAUGHT_EXCEPTION',
-      detail: { message: err.message }
-    }).catch(() => {}); // never let logging itself throw here
-    return sendError(res, 500, ERROR_CODES.UNKNOWN_ERROR, 'Internal server error');
-  }
-
 });
 
 module.exports = router;
