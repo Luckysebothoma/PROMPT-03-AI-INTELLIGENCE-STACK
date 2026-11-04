@@ -91,7 +91,7 @@ router.get('/help', (req, res) => {
     service: 'AI Gateway Day 5 - AI Intelligence / Task Routing / Provider & Model Orchestration',
     endpoints: [
       'GET /health', 'GET /ready', 'GET /dependencies', 'GET /help', 'GET /metrics',
-      'POST /v1/chat', 'POST /v1/classify', 'POST /v1/resolve', 'POST /v1/execute',
+      'POST /v1/chat', 'POST /v1/chat/completions (OpenAI-compatible)', 'POST /v1/classify', 'POST /v1/resolve', 'POST /v1/execute',
       'GET /v1/context/status', 'GET /v1/providers', 'GET /v1/providers/:provider',
       'GET /v1/models', 'GET /v1/models/:model',
       'GET /v1/workers', 'GET /v1/workers/:worker',
@@ -124,7 +124,13 @@ router.get('/v1/providers/:provider', (req, res) => {
 });
 
 router.get('/v1/models', (req, res) => {
-  res.json({ success: true, models: registry.getModels() });
+  const models = registry.getModels().filter((m) => registry.isModelSelectable(m));
+  res.json({
+    success: true,
+    models,
+    object: 'list',
+    data: models.map((m) => ({ id: m.model, object: 'model', created: 0, owned_by: m.provider }))
+  });
 });
 
 router.get('/v1/models/:model', (req, res) => {
@@ -381,6 +387,17 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
   }
 }
 
+  // OpenAI-compatible clients may request a concrete model ID. Honour it only
+  // when it is enabled, selectable, and advertises the chat capability.
+  const requestedModel = req.body && req.body.requested_model;
+  if (requestedModel) {
+    const selected = registry.getModels().find((m) => m.model === requestedModel && registry.isModelSelectable(m) && (m.capabilities || []).includes('chat'));
+    if (!selected || !registry.getProvider(selected.provider) || !registry.getProvider(selected.provider).enabled) {
+      return sendError(res, 404, ERROR_CODES.MODEL_NOT_FOUND, 'Requested chat model is unavailable', { model: requestedModel });
+    }
+    resolved = { ...resolved, provider: selected.provider, model: selected.model };
+  }
+
   if (!resolved.ok) {
     metrics.normalizedErrorsTotal.inc({ code: resolved.code });
     await db.logOrchestrationEvent({
@@ -481,6 +498,83 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
     return sendError(res, 500, ERROR_CODES.UNKNOWN_ERROR, 'Internal server error');
   }
 
+});
+
+
+// ---------------------------------------------------------------------
+// OpenAI-compatible API for Open WebUI and other OpenAI clients
+// ---------------------------------------------------------------------
+function requireOpenAICompatAuth(req, res, next) {
+  // Fail closed: never expose this LAN-facing endpoint without an explicit key.
+  if (!config.openAICompatApiKey) {
+    return res.status(503).json({ error: { message: 'OpenAI-compatible API is not configured; set OPENAI_COMPAT_API_KEY', type: 'server_error', code: 'API_NOT_CONFIGURED' } });
+  }
+  const supplied = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  if (!supplied || supplied[1] !== config.openAICompatApiKey) {
+    return res.status(401).json({ error: { message: 'Invalid or missing Bearer API key', type: 'authentication_error', code: 'INVALID_API_KEY' } });
+  }
+  next();
+}
+
+router.post('/v1/chat/completions', requireOpenAICompatAuth, async (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return res.status(400).json({ error: { message: 'messages must be a non-empty array', type: 'invalid_request_error', param: 'messages' } });
+  }
+  const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+  const transcript = body.messages.map((m) => {
+    const role = typeof m.role === 'string' ? m.role : 'user';
+    let content = m.content;
+    if (Array.isArray(content)) content = content.filter((part) => part && part.type === 'text').map((part) => part.text || '').join('\n');
+    if (typeof content !== 'string') content = '';
+    return role.toUpperCase() + ': ' + content;
+  }).filter((line) => !line.endsWith(': ')).join('\n\n');
+  if (!transcript.trim()) {
+    return res.status(400).json({ error: { message: 'messages must contain text content', type: 'invalid_request_error', param: 'messages' } });
+  }
+  try {
+    const axios = require('axios');
+    const response = await axios.post('http://127.0.0.1:' + config.port + '/v1/chat', {
+      message: transcript,
+      requested_model: model,
+      user_id: body.user || 'open-webui',
+      agent_name: 'open-webui',
+      metadata: { source: 'openai-compatible-api' }
+    }, { timeout: 180000 });
+    const result = response.data || {};
+    const completion = {
+      id: 'chatcmpl-' + uuidv4(),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: result.model || model || 'auto',
+      choices: [{ index: 0, message: { role: 'assistant', content: result.response || '' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      gateway: { request_id: result.request_id, trace_id: result.trace_id, provider: result.provider, worker: result.worker }
+    };
+    if (body.stream === true) {
+      // Buffered SSE compatibility: preserve the OpenAI streaming wire format
+      // while the underlying Day 5 orchestration returns a complete response.
+      const chunkBase = { id: completion.id, object: 'chat.completion.chunk', created: completion.created, model: completion.model };
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }) + '\\n\\n');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: { content: completion.choices[0].message.content }, finish_reason: null }] }) + '\\n\\n');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\\n\\n');
+      return res.end('data: [DONE]\\n\\n');
+    }
+    return res.json(completion);
+  } catch (err) {
+    const status = err.response && err.response.status ? err.response.status : 502;
+    const payload = err.response && err.response.data;
+    return res.status(status).json({
+      error: {
+        message: payload && payload.error && payload.error.message ? payload.error.message : 'AI Gateway orchestration failed',
+        type: 'gateway_error',
+        code: payload && payload.error && payload.error.code ? payload.error.code : 'UPSTREAM_ERROR'
+      }
+    });
+  }
 });
 
 module.exports = router;
