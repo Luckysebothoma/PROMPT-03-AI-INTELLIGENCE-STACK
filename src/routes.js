@@ -91,7 +91,7 @@ router.get('/help', (req, res) => {
     service: 'AI Gateway Day 5 - AI Intelligence / Task Routing / Provider & Model Orchestration',
     endpoints: [
       'GET /health', 'GET /ready', 'GET /dependencies', 'GET /help', 'GET /metrics',
-      'POST /v1/chat', 'POST /v1/classify', 'POST /v1/resolve', 'POST /v1/execute',
+      'POST /v1/chat', 'POST /v1/chat/completions (OpenAI-compatible)', 'POST /v1/classify', 'POST /v1/resolve', 'POST /v1/execute',
       'GET /v1/context/status', 'GET /v1/providers', 'GET /v1/providers/:provider',
       'GET /v1/models', 'GET /v1/models/:model',
       'GET /v1/workers', 'GET /v1/workers/:worker',
