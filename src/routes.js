@@ -201,17 +201,6 @@ router.post('/v1/resolve', (req, res) => {
     return sendError(res, 400, ERROR_CODES.INVALID_REQUEST, 'Field "capability" is required');
   }
   const resolved = resolver.resolveCapability(capability);
-  // OpenAI-compatible clients may request a concrete model ID. Honour it only
-  // when it is enabled, selectable, and advertises the chat capability.
-  const requestedModel = req.body && req.body.requested_model;
-  if (requestedModel) {
-    const selected = registry.getModels().find((m) => m.model === requestedModel && registry.isModelSelectable(m) && (m.capabilities || []).includes('chat'));
-    if (!selected || !registry.getProvider(selected.provider) || !registry.getProvider(selected.provider).enabled) {
-      return sendError(res, 404, ERROR_CODES.MODEL_NOT_FOUND, 'Requested chat model is unavailable', { model: requestedModel });
-    }
-    resolved = { ...resolved, provider: selected.provider, model: selected.model };
-  }
-
   if (!resolved.ok) {
     metrics.normalizedErrorsTotal.inc({ code: resolved.code });
     return sendError(res, 404, resolved.code, resolved.message);
@@ -397,6 +386,17 @@ if (!resolved.ok && effectiveCapability !== 'chat') {
     effectiveCapability = 'chat';
   }
 }
+
+  // OpenAI-compatible clients may request a concrete model ID. Honour it only
+  // when it is enabled, selectable, and advertises the chat capability.
+  const requestedModel = req.body && req.body.requested_model;
+  if (requestedModel) {
+    const selected = registry.getModels().find((m) => m.model === requestedModel && registry.isModelSelectable(m) && (m.capabilities || []).includes('chat'));
+    if (!selected || !registry.getProvider(selected.provider) || !registry.getProvider(selected.provider).enabled) {
+      return sendError(res, 404, ERROR_CODES.MODEL_NOT_FOUND, 'Requested chat model is unavailable', { model: requestedModel });
+    }
+    resolved = { ...resolved, provider: selected.provider, model: selected.model };
+  }
 
   if (!resolved.ok) {
     metrics.normalizedErrorsTotal.inc({ code: resolved.code });
