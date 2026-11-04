@@ -236,6 +236,7 @@ const config = {
   },
 
   maxOrchestrationDepth: parseInt(process.env.MAX_ORCHESTRATION_DEPTH || '3', 10),
+  openAICompatApiKey: process.env.OPENAI_COMPAT_API_KEY || '',
 
   providers: parseJsonEnv('AI_PROVIDERS_JSON', DEFAULT_PROVIDERS),
   models: parseJsonEnv('AI_MODELS_JSON', DEFAULT_MODELS),
