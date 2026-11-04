@@ -83,7 +83,7 @@ Open WebUI → Admin Settings → Connections → OpenAI API → Add connection:
 - Prefix ID: `cloud-gateway`
 - Model IDs: leave empty to discover models from `GET /v1/models`
 
-The adapter accepts OpenAI `messages[]`, passes the role-labelled conversation transcript through Day 5's existing `/v1/chat` intelligence pipeline, and returns a standard `chat.completion` response. A requested model is honoured only when it is enabled and advertises the `chat` capability. The initial adapter is non-streaming: set `stream=false` (streaming requests receive a clear 400 response). Token usage is currently returned as zero because the existing Day 5/Day 3 contract does not expose reliable usage counts.
+The adapter accepts OpenAI `messages[]`, passes the role-labelled conversation transcript through Day 5's existing `/v1/chat` intelligence pipeline, and returns a standard `chat.completion` response. A requested model is honoured only when it is enabled and advertises the `chat` capability. The adapter supports the OpenAI SSE streaming wire format using buffered delivery: it runs the existing complete Day 5 orchestration first, then emits the assistant result as SSE chunks. This is compatible with clients that request `stream=true`, but it is not token-by-token upstream streaming. Token usage is currently returned as zero because the existing Day 5/Day 3 contract does not expose reliable usage counts.
 
 ### `POST /v1/chat`
 
