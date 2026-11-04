@@ -64,6 +64,27 @@ your actual Day 3 / Day 4 deployments.
 | GET | `/v1/workers`, `/v1/workers/:worker` | Worker registry |
 | GET | `/v1/capabilities` | Distinct capabilities across all models |
 
+### OpenAI-compatible API (Open WebUI)
+
+Day 5 exposes an authenticated OpenAI-compatible chat endpoint for local GUI clients:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/models` | Existing registry plus OpenAI `data[]` model-list shape |
+| POST | `/v1/chat/completions` | OpenAI-compatible non-streaming chat completion |
+
+Set `OPENAI_COMPAT_API_KEY` in Day 5's `.env` to a long random secret and restart the service. The endpoint fails closed (503) when the key is not configured and requires `Authorization: Bearer <key>` (401 when missing/incorrect). Do not expose this HTTP/LAN endpoint to the public internet; use a private network or HTTPS reverse proxy for remote access.
+
+Open WebUI → Admin Settings → Connections → OpenAI API → Add connection:
+
+- API Base URL: `http://192.168.0.140:4407/v1`
+- Auth: Bearer
+- API Key: the value of `OPENAI_COMPAT_API_KEY`
+- Prefix ID: `cloud-gateway`
+- Model IDs: leave empty to discover models from `GET /v1/models`
+
+The adapter accepts OpenAI `messages[]`, passes the role-labelled conversation transcript through Day 5's existing `/v1/chat` intelligence pipeline, and returns a standard `chat.completion` response. A requested model is honoured only when it is enabled and advertises the `chat` capability. The initial adapter is non-streaming: set `stream=false` (streaming requests receive a clear 400 response). Token usage is currently returned as zero because the existing Day 5/Day 3 contract does not expose reliable usage counts.
+
 ### `POST /v1/chat`
 
 ```json
