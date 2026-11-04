@@ -521,9 +521,6 @@ router.post('/v1/chat/completions', requireOpenAICompatAuth, async (req, res) =>
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return res.status(400).json({ error: { message: 'messages must be a non-empty array', type: 'invalid_request_error', param: 'messages' } });
   }
-  if (body.stream === true) {
-    return res.status(400).json({ error: { message: 'Streaming is not yet supported; set stream=false', type: 'invalid_request_error', param: 'stream' } });
-  }
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
   const transcript = body.messages.map((m) => {
     const role = typeof m.role === 'string' ? m.role : 'user';
@@ -554,6 +551,18 @@ router.post('/v1/chat/completions', requireOpenAICompatAuth, async (req, res) =>
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       gateway: { request_id: result.request_id, trace_id: result.trace_id, provider: result.provider, worker: result.worker }
     };
+    if (body.stream === true) {
+      // Buffered SSE compatibility: preserve the OpenAI streaming wire format
+      // while the underlying Day 5 orchestration returns a complete response.
+      const chunkBase = { id: completion.id, object: 'chat.completion.chunk', created: completion.created, model: completion.model };
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }) + '\\n\\n');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: { content: completion.choices[0].message.content }, finish_reason: null }] }) + '\\n\\n');
+      res.write('data: ' + JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\\n\\n');
+      return res.end('data: [DONE]\\n\\n');
+    }
     return res.json(completion);
   } catch (err) {
     const status = err.response && err.response.status ? err.response.status : 502;
